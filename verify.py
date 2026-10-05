@@ -8,7 +8,9 @@ Runs three stages and summarizes them in the process exit code:
   3. SMOKE  - black-box checks against the live HTTP API: shortest-arc
               interpolation accuracy/continuity and rejection of
               over-long sample gaps (plus zero-quaternion, 180-degree
-              ambiguity and non-increasing-time rejections)
+              ambiguity and non-increasing-time rejections); rolling-
+              shutter per-row projection in both directions, its
+              locatable rejections, and a legacy-shape regression check
 
 Exit code is a bitmask so a single value summarizes every stage:
 
@@ -247,6 +249,99 @@ def check_smoke() -> bool:
     expect(400 <= status < 500 and detail.get("code") == "NON_INCREASING_SAMPLE_TIME"
            and detail.get("index") == 1,
            f"non-increasing sample times rejected with index (got {status} {detail})")
+
+    # -- 7. rolling shutter, top_to_bottom: per-row exposure times ---------
+    rs_payload = {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + gap, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},  # +90 deg about z
+        ],
+        "queries": [{"frameT": T0, "row": k} for k in range(5)],
+        "max_gap_ns": gap,
+        "rolling_shutter": {
+            "rowCount": 5,
+            "linePeriodNs": 2_500,
+            "direction": "top_to_bottom",
+        },
+    }
+    status, body = post_interpolate(rs_payload)
+    expect(status == 200, f"rolling-shutter request returns 200 (got {status})")
+    if status == 200:
+        attitudes = body.get("attitudes", [])
+        expect([a.get("t") for a in attitudes] == [T0 + 2_500 * k for k in range(5)]
+               and [a.get("row") for a in attitudes] == list(range(5))
+               and all(a.get("frameT") == T0 for a in attitudes),
+               "top_to_bottom derives t = frameT + row * linePeriodNs in request order")
+        analytic_ok = True
+        unit_ok = True
+        for entry, u in zip(attitudes, (0.0, 0.25, 0.5, 0.75, 1.0)):
+            q = entry["q"]
+            expected = q_z(u * math.pi / 2.0)
+            if any(abs(a - e) > 1e-9 for a, e in zip(q, expected)):
+                analytic_ok = False
+            if abs(sum(c * c for c in q) - 1.0) > 1e-9:
+                unit_ok = False
+        expect(analytic_ok and unit_ok,
+               "rolling-shutter attitudes match analytic slerp and are unit norm")
+
+    # -- 8. rolling shutter, bottom_to_top: row 0 exposes last -------------
+    btt_payload = json.loads(json.dumps(rs_payload))
+    btt_payload["rolling_shutter"]["direction"] = "bottom_to_top"
+    btt_payload["queries"] = [{"frameT": T0, "row": k} for k in (4, 3, 2, 1, 0)]
+    status, body = post_interpolate(btt_payload)
+    expect(status == 200, f"bottom_to_top request returns 200 (got {status})")
+    if status == 200:
+        attitudes = body.get("attitudes", [])
+        expect([a.get("t") for a in attitudes] == [T0 + 2_500 * k for k in range(5)]
+               and [a.get("row") for a in attitudes] == [4, 3, 2, 1, 0],
+               "bottom_to_top derives t = frameT + (rowCount-1-row) * linePeriodNs")
+        analytic_ok = all(
+            all(abs(a - e) <= 1e-9
+                for a, e in zip(entry["q"], q_z(u * math.pi / 2.0)))
+            for entry, u in zip(attitudes, (0.0, 0.25, 0.5, 0.75, 1.0))
+        )
+        expect(analytic_ok,
+               "bottom_to_top attitudes match analytic slerp within 1e-9")
+
+    # -- 9. rolling-shutter rejections locate the query or config field ----
+    bad_row = json.loads(json.dumps(rs_payload))
+    bad_row["queries"] = [{"frameT": T0, "row": 5}]  # rowCount is 5
+    status, body = post_interpolate(bad_row)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500 and detail.get("code") == "ROW_OUT_OF_RANGE"
+           and detail.get("index") == 0 and detail.get("path") == "queries[0].row",
+           f"out-of-range row rejected with query index (got {status} {detail})")
+    expect("attitudes" not in body,
+           "rejected rolling-shutter request yields no partial results")
+
+    inverted = json.loads(json.dumps(rs_payload))
+    inverted["rolling_shutter"]["direction"] = "bottom_to_top"
+    inverted["queries"] = [{"frameT": T0, "row": 0}, {"frameT": T0, "row": 1}]
+    status, body = post_interpolate(inverted)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500
+           and detail.get("code") == "NON_INCREASING_DERIVED_TIME"
+           and detail.get("index") == 1,
+           f"non-increasing derived times rejected with query index "
+           f"(got {status} {detail})")
+
+    bad_config = json.loads(json.dumps(rs_payload))
+    bad_config["rolling_shutter"]["rowCount"] = 1
+    status, body = post_interpolate(bad_config)
+    detail = body.get("detail", {})
+    expect(400 <= status < 500 and detail.get("code") == "ROW_COUNT_OUT_OF_RANGE"
+           and detail.get("path") == "rolling_shutter.rowCount",
+           f"invalid rolling-shutter config located to the field "
+           f"(got {status} {detail})")
+
+    # -- 10. regression: omitting rolling_shutter keeps the legacy shape ---
+    status, body = post_interpolate(payload)  # integer queries from check 1
+    legacy_ok = (
+        status == 200
+        and all(set(a.keys()) == {"t", "q"} for a in body.get("attitudes", []))
+    )
+    expect(legacy_ok,
+           "without rolling_shutter the response keeps the legacy {t, q} shape")
 
     if failures:
         print(f"SMOKE: FAIL ({len(failures)} check(s) failed)")

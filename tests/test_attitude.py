@@ -478,7 +478,6 @@ class TestQueryValidation:
 # ---------------------------------------------------------------------------
 # validation: envelope
 # ---------------------------------------------------------------------------
-
 class TestEnvelope:
     def test_body_must_be_object(self):
         with pytest.raises(AttitudeInputError) as excinfo:
@@ -503,3 +502,311 @@ class TestEnvelope:
         assert data["index"] == 0
         assert data["path"] == "samples[0].q"
         assert "message" in data
+
+
+# ---------------------------------------------------------------------------
+# rolling shutter (per-row exposure times)
+# ---------------------------------------------------------------------------
+
+def rolling_payload(rows=(0, 1, 2, 3, 4), direction="top_to_bottom", row_count=5,
+                    line_period_ns=2_500, frame_t=T0, gap=10_000,
+                    angle=math.pi / 2, max_gap_ns=10_000, samples=None):
+    """Rolling-shutter request: one 90-degree z sweep over `gap` ns."""
+    if samples is None:
+        samples = [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + gap, q_z(angle))]
+    frame_ts = frame_t if isinstance(frame_t, (list, tuple)) else [frame_t] * len(rows)
+    return {
+        "samples": [{"t": t, "q": list(q)} for t, q in samples],
+        "queries": [{"frameT": ft, "row": r} for ft, r in zip(frame_ts, rows)],
+        "max_gap_ns": max_gap_ns,
+        "rolling_shutter": {
+            "rowCount": row_count,
+            "linePeriodNs": line_period_ns,
+            "direction": direction,
+        },
+    }
+
+
+class TestRollingShutterInterpolation:
+    def test_top_to_bottom_derives_row_exposure_times(self):
+        result = interpolate_attitudes(rolling_payload())
+        assert [e["t"] for e in result] == [T0 + 2_500 * k for k in range(5)]
+        assert [e["frameT"] for e in result] == [T0] * 5
+        assert [e["row"] for e in result] == [0, 1, 2, 3, 4]
+
+    def test_top_to_bottom_matches_analytic_slerp(self):
+        result = interpolate_attitudes(rolling_payload())
+        for entry, u in zip(result, (0.0, 0.25, 0.5, 0.75, 1.0)):
+            assert_quat_close(entry["q"], q_z(u * math.pi / 2))
+
+    def test_bottom_to_top_maps_row_zero_to_last_line(self):
+        # rows listed so the derived times still increase
+        result = interpolate_attitudes(
+            rolling_payload(rows=(4, 3, 2, 1, 0), direction="bottom_to_top")
+        )
+        assert [e["t"] for e in result] == [T0 + 2_500 * k for k in range(5)]
+        for entry, u in zip(result, (0.0, 0.25, 0.5, 0.75, 1.0)):
+            assert_quat_close(entry["q"], q_z(u * math.pi / 2))
+
+    def test_multiple_frames_returned_in_request_order(self):
+        payload = rolling_payload(rows=(2, 1), frame_t=[T0, T0 + 6_000])
+        result = interpolate_attitudes(payload)
+        assert [(e["frameT"], e["row"], e["t"]) for e in result] == [
+            (T0, 2, T0 + 5_000),
+            (T0 + 6_000, 1, T0 + 8_500),
+        ]
+        assert_quat_close(result[0]["q"], q_z(0.5 * math.pi / 2))
+        assert_quat_close(result[1]["q"], q_z(0.85 * math.pi / 2))
+
+    def test_results_are_unit_norm(self):
+        for entry in interpolate_attitudes(rolling_payload()):
+            assert abs(norm(entry["q"]) - 1.0) <= 1e-9
+
+    def test_sign_convention_applies_across_rows(self):
+        # a 170-degree sweep sampled per row: dots must stay non-negative
+        payload = rolling_payload(
+            rows=tuple(range(11)), row_count=11, line_period_ns=1_000,
+            angle=math.radians(170.0),
+        )
+        result = interpolate_attitudes(payload)
+        quats = [entry["q"] for entry in result]
+        leading = next(c for c in quats[0] if c != 0.0)
+        assert leading > 0.0
+        for previous, current in zip(quats, quats[1:]):
+            assert dot(previous, current) >= 0.0
+
+    def test_shortest_arc_still_applies_with_sign_flipped_sample(self):
+        samples = [
+            (T0, [1.0, 0.0, 0.0, 0.0]),
+            (T0 + 10_000, [-c for c in q_z(math.pi / 2)]),
+        ]
+        result = interpolate_attitudes(rolling_payload(rows=(2,), samples=samples))
+        assert_quat_close(result[0]["q"], q_z(math.pi / 4))
+
+    def test_row_count_boundaries_accepted(self):
+        assert len(interpolate_attitudes(
+            rolling_payload(rows=(0, 1), row_count=2, line_period_ns=1_000)
+        )) == 2
+        assert len(interpolate_attitudes(
+            rolling_payload(rows=(0, 1), row_count=20_000, line_period_ns=1_000)
+        )) == 2
+
+
+class TestRollingShutterDerivedTimes:
+    def test_derived_times_must_be_strictly_increasing(self):
+        # bottom_to_top with increasing rows runs backwards in time
+        payload = rolling_payload(rows=(2, 3), direction="bottom_to_top")
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "NON_INCREASING_DERIVED_TIME"
+        assert err.index == 1
+        assert err.path == "queries[1]"
+        assert err.context["previous_index"] == 0
+
+    def test_equal_derived_times_rejected(self):
+        # same frame and same row exposes at the same instant twice
+        payload = rolling_payload(rows=(2, 2))
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "NON_INCREASING_DERIVED_TIME"
+        assert excinfo.value.index == 1
+
+    def test_cross_frame_inversion_rejected(self):
+        payload = rolling_payload(rows=(1, 0), frame_t=[T0, T0])
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "NON_INCREASING_DERIVED_TIME"
+
+    @pytest.mark.parametrize("offset", [-100, 10_001])
+    def test_derived_time_outside_sample_range_rejected(self, offset):
+        payload = rolling_payload(rows=(0,), frame_t=T0 + offset)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "QUERY_OUT_OF_RANGE"
+        assert err.index == 0
+        assert err.path == "queries[0]"
+
+    def test_derived_time_in_long_gap_rejected(self):
+        samples = [
+            (T0, [1.0, 0.0, 0.0, 0.0]),
+            (T0 + 100, q_z(0.2)),
+            (T0 + 10_000_000, q_z(0.4)),
+        ]
+        payload = rolling_payload(
+            rows=(0, 0), frame_t=[T0 + 50, T0 + 5_000_000],
+            samples=samples, max_gap_ns=100,
+        )
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "SAMPLE_GAP_EXCEEDED"
+        assert err.index == 1
+        assert err.context["sample_index"] == 1
+
+    def test_no_partial_results_on_late_failure(self):
+        samples = [
+            (T0, [1.0, 0.0, 0.0, 0.0]),
+            (T0 + 100, q_z(0.2)),
+            (T0 + 10_000_000, q_z(0.4)),
+        ]
+        payload = rolling_payload(
+            rows=(0, 0), frame_t=[T0 + 50, T0 + 5_000_000],
+            samples=samples, max_gap_ns=100,
+        )
+        with pytest.raises(AttitudeInputError):
+            interpolate_attitudes(payload)  # raises before returning anything
+
+
+class TestRollingShutterConfigValidation:
+    @pytest.mark.parametrize("row_count", [0, 1, 20_001, -5])
+    def test_row_count_out_of_range(self, row_count):
+        payload = rolling_payload(row_count=row_count)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "ROW_COUNT_OUT_OF_RANGE"
+        assert err.path == "rolling_shutter.rowCount"
+
+    @pytest.mark.parametrize("bad", ["5", None, [5], 2.5, True])
+    def test_row_count_wrong_type(self, bad):
+        payload = rolling_payload(row_count=bad)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "INVALID_TYPE"
+        assert excinfo.value.path == "rolling_shutter.rowCount"
+
+    @pytest.mark.parametrize("period", [0, -1, -1_000])
+    def test_non_positive_line_period_rejected(self, period):
+        payload = rolling_payload(line_period_ns=period)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "INVALID_LINE_PERIOD"
+        assert err.path == "rolling_shutter.linePeriodNs"
+
+    def test_line_period_wrong_type(self):
+        payload = rolling_payload(line_period_ns="500")
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "INVALID_TYPE"
+        assert excinfo.value.path == "rolling_shutter.linePeriodNs"
+
+    def test_line_period_non_integer_rejected(self):
+        payload = rolling_payload(line_period_ns=2_500.5)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "NON_INTEGER_TIMESTAMP"
+        assert excinfo.value.path == "rolling_shutter.linePeriodNs"
+
+    @pytest.mark.parametrize("bad", ["sideways", "", 1, None, ["top_to_bottom"]])
+    def test_invalid_direction(self, bad):
+        payload = rolling_payload(direction=bad)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "INVALID_DIRECTION"
+        assert err.path == "rolling_shutter.direction"
+
+    @pytest.mark.parametrize("field", ["rowCount", "linePeriodNs", "direction"])
+    def test_missing_config_field(self, field):
+        payload = rolling_payload()
+        del payload["rolling_shutter"][field]
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "MISSING_FIELD"
+        assert err.path == f"rolling_shutter.{field}"
+
+    @pytest.mark.parametrize("bad", ["top_to_bottom", 5, None, []])
+    def test_rolling_shutter_must_be_object(self, bad):
+        payload = rolling_payload()
+        payload["rolling_shutter"] = bad
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "INVALID_TYPE"
+        assert err.path == "rolling_shutter"
+
+
+class TestRollingShutterQueryValidation:
+    @pytest.mark.parametrize("row", [-1, 5, 100])
+    def test_row_out_of_range(self, row):
+        payload = rolling_payload(rows=(row,))
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "ROW_OUT_OF_RANGE"
+        assert err.index == 0
+        assert err.path == "queries[0].row"
+        assert err.context["row"] == row
+        assert err.context["row_count"] == 5
+
+    def test_row_out_of_range_locates_later_query(self):
+        payload = rolling_payload(rows=(0, 1, 7))
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "ROW_OUT_OF_RANGE"
+        assert err.index == 2
+        assert err.path == "queries[2].row"
+
+    @pytest.mark.parametrize("bad", ["1", 1.5, True, None, [1]])
+    def test_row_wrong_type(self, bad):
+        payload = rolling_payload(rows=(bad,))
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "INVALID_TYPE"
+        assert excinfo.value.path == "queries[0].row"
+
+    def test_query_item_must_be_object(self):
+        payload = rolling_payload()
+        payload["queries"] = [T0, T0 + 2_500]
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "INVALID_TYPE"
+        assert err.index == 0
+        assert err.path == "queries[0]"
+
+    @pytest.mark.parametrize("field", ["frameT", "row"])
+    def test_missing_query_field(self, field):
+        payload = rolling_payload()
+        del payload["queries"][0][field]
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "MISSING_FIELD"
+        assert err.path == f"queries[0].{field}"
+
+    def test_non_integer_frame_t_rejected(self):
+        payload = rolling_payload(rows=(0,), frame_t=1_000.5)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        err = excinfo.value
+        assert err.code == "NON_INTEGER_TIMESTAMP"
+        assert err.path == "queries[0].frameT"
+
+    def test_boolean_frame_t_rejected(self):
+        payload = rolling_payload(rows=(0,), frame_t=True)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "INVALID_TYPE"
+
+    def test_query_count_limits_still_apply(self):
+        payload = rolling_payload(rows=tuple(range(501)), row_count=501,
+                                  line_period_ns=1)
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "QUERY_COUNT_OUT_OF_RANGE"
+
+    def test_object_queries_rejected_without_rolling_shutter(self):
+        payload = make_payload(
+            [(T0, [1.0, 0.0, 0.0, 0.0]), (T0 + 10, [1.0, 0.0, 0.0, 0.0])],
+            [T0],
+        )
+        payload["queries"] = [{"frameT": T0, "row": 0}]
+        with pytest.raises(AttitudeInputError) as excinfo:
+            interpolate_attitudes(payload)
+        assert excinfo.value.code == "INVALID_TYPE"

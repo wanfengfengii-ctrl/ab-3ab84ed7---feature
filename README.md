@@ -75,6 +75,56 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
 - **符号约定**：首项的第一个非零分量为正；后续项选取使与前项内积
   非负的等价符号（`q` / `-q`），保证相邻曝光姿态连续、无正负翻转。
 
+### 逐行曝光投影（可选 `rolling_shutter`）
+
+部分航摄相机逐行曝光，同一帧各行的真实采集时刻不同。请求体加入可选
+对象 `rolling_shutter` 后，`queries` 的每一项改为
+`{"frameT": <ns>, "row": <int>}`：
+
+```json
+{
+  "samples": [
+    {"t": 1700000000000000000, "q": [1.0, 0.0, 0.0, 0.0]},
+    {"t": 1700000000000010000, "q": [0.7071067811865476, 0.0, 0.0, 0.7071067811865476]}
+  ],
+  "queries": [
+    {"frameT": 1700000000000000000, "row": 0},
+    {"frameT": 1700000000000000000, "row": 1}
+  ],
+  "max_gap_ns": 10000,
+  "rolling_shutter": {"rowCount": 2000, "linePeriodNs": 500, "direction": "top_to_bottom"}
+}
+```
+
+| 字段 | 约束 |
+|---|---|
+| `rolling_shutter.rowCount` | 2–20000 的整数（每帧行数） |
+| `rolling_shutter.linePeriodNs` | 正整数（相邻行的曝光间隔，纳秒） |
+| `rolling_shutter.direction` | `top_to_bottom` 或 `bottom_to_top` |
+| `queries[i].frameT` | 纳秒整数时间戳（帧参考时刻，约束同整数查询） |
+| `queries[i].row` | 零基行号，`0 <= row < rowCount` |
+
+每行的派生采集时刻为 `t = frameT + seq * linePeriodNs`：`top_to_bottom`
+时 `seq = row`，`bottom_to_top` 时 `seq = rowCount - 1 - row`（第 0 行
+最后曝光）。派生时刻按请求顺序**严格递增**，并沿用整数查询的全部规则：
+采样闭区间、`max_gap_ns` 包围间隔上限、最短弧插值与连续定号。
+
+成功项按请求顺序返回 `frameT`、`row`、派生 `t` 与单位四元数：
+
+```json
+{
+  "attitudes": [
+    {"frameT": 1700000000000000000, "row": 0, "t": 1700000000000000000,
+     "q": [1.0, 0.0, 0.0, 0.0]}
+  ]
+}
+```
+
+省略 `rolling_shutter` 时，`queries` 仍为整数时间戳数组，响应与错误
+语义完全不变。行号越界、配置非法、派生时刻倒序、越出样本范围或落入
+超长间隙均返回 4xx，`index`/`path` 定位到查询索引或配置字段，且不
+产生部分姿态。
+
 ### 错误响应（4xx，不产生部分结果）
 
 任何输入越界、零四元数、非递增时间、180° 歧义或超长间隙都会返回
@@ -100,7 +150,9 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
 `NON_INCREASING_SAMPLE_TIME`、`NON_INCREASING_QUERY_TIME`、
 `AMBIGUOUS_180_DEGREE_ROTATION`（相邻旋转恰为 180°，最短弧不唯一）、
 `QUERY_OUT_OF_RANGE`、`NEGATIVE_MAX_GAP`、`SAMPLE_GAP_EXCEEDED`、
-`INVALID_JSON` / `INVALID_BODY`。
+`INVALID_JSON` / `INVALID_BODY`；逐行曝光相关：
+`ROW_COUNT_OUT_OF_RANGE`、`INVALID_LINE_PERIOD`、`INVALID_DIRECTION`、
+`ROW_OUT_OF_RANGE`、`NON_INCREASING_DERIVED_TIME`（派生曝光时刻未严格递增）。
 
 ### `GET /health`
 

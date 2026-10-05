@@ -166,3 +166,125 @@ class TestErrorResponses:
     def test_get_on_interpolate_not_allowed(self):
         response = client.get("/api/attitudes/interpolate")
         assert 400 <= response.status_code < 500
+
+
+def rolling_payload(**overrides):
+    payload = {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + 10_000, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},
+        ],
+        "queries": [{"frameT": T0, "row": k} for k in range(5)],
+        "max_gap_ns": 10_000,
+        "rolling_shutter": {
+            "rowCount": 5,
+            "linePeriodNs": 2_500,
+            "direction": "top_to_bottom",
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestRollingShutterApi:
+    def test_top_to_bottom_happy_path(self):
+        response = post(rolling_payload())
+        assert response.status_code == 200
+        attitudes = response.json()["attitudes"]
+        assert [a["t"] for a in attitudes] == [T0 + 2_500 * k for k in range(5)]
+        assert [a["row"] for a in attitudes] == [0, 1, 2, 3, 4]
+        assert all(a["frameT"] == T0 for a in attitudes)
+        midpoint = attitudes[2]["q"]
+        expected = [math.cos(math.pi / 8), 0.0, 0.0, math.sin(math.pi / 8)]
+        for actual, want in zip(midpoint, expected):
+            assert abs(actual - want) <= 1e-9
+        for a in attitudes:
+            assert abs(sum(c * c for c in a["q"]) - 1.0) <= 1e-9
+
+    def test_bottom_to_top_happy_path(self):
+        payload = rolling_payload()
+        payload["rolling_shutter"]["direction"] = "bottom_to_top"
+        payload["queries"] = [{"frameT": T0, "row": k} for k in (4, 3, 2, 1, 0)]
+        response = post(payload)
+        assert response.status_code == 200
+        attitudes = response.json()["attitudes"]
+        # row 0 is exposed last: t = frameT + (rowCount - 1 - row) * linePeriodNs
+        assert [a["t"] for a in attitudes] == [T0 + 2_500 * k for k in range(5)]
+        assert [a["row"] for a in attitudes] == [4, 3, 2, 1, 0]
+        midpoint = attitudes[2]["q"]
+        expected = [math.cos(math.pi / 8), 0.0, 0.0, math.sin(math.pi / 8)]
+        for actual, want in zip(midpoint, expected):
+            assert abs(actual - want) <= 1e-9
+
+    def test_row_out_of_range_locates_query(self):
+        payload = rolling_payload()
+        payload["queries"][2]["row"] = 5
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "ROW_OUT_OF_RANGE"
+        assert detail["index"] == 2
+        assert detail["path"] == "queries[2].row"
+        assert "attitudes" not in response.json()
+
+    def test_invalid_config_locates_field(self):
+        payload = rolling_payload()
+        payload["rolling_shutter"]["rowCount"] = 1
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "ROW_COUNT_OUT_OF_RANGE"
+        assert detail["path"] == "rolling_shutter.rowCount"
+
+    def test_invalid_direction_rejected(self):
+        payload = rolling_payload()
+        payload["rolling_shutter"]["direction"] = "left_to_right"
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "INVALID_DIRECTION"
+        assert detail["path"] == "rolling_shutter.direction"
+
+    def test_non_increasing_derived_times_rejected(self):
+        payload = rolling_payload()
+        payload["rolling_shutter"]["direction"] = "bottom_to_top"
+        payload["queries"] = [{"frameT": T0, "row": 0}, {"frameT": T0, "row": 1}]
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "NON_INCREASING_DERIVED_TIME"
+        assert detail["index"] == 1
+        assert "attitudes" not in response.json()
+
+    def test_derived_time_out_of_sample_range(self):
+        payload = rolling_payload()
+        payload["queries"] = [{"frameT": T0 + 20_000, "row": 0}]
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "QUERY_OUT_OF_RANGE"
+        assert detail["index"] == 0
+
+    def test_derived_time_in_long_gap_rejected(self):
+        payload = rolling_payload(max_gap_ns=5_000)
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "SAMPLE_GAP_EXCEEDED"
+        assert detail["index"] == 0
+        assert "attitudes" not in response.json()
+
+    def test_integer_queries_rejected_when_rolling_enabled(self):
+        payload = rolling_payload()
+        payload["queries"] = [T0, T0 + 2_500]
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "INVALID_TYPE"
+        assert detail["path"] == "queries[0]"
+
+    def test_legacy_response_shape_unchanged_without_rolling_shutter(self):
+        response = post(valid_payload())
+        assert response.status_code == 200
+        for entry in response.json()["attitudes"]:
+            assert set(entry.keys()) == {"t", "q"}
