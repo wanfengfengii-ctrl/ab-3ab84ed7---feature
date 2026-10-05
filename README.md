@@ -102,6 +102,66 @@ API_BASE_URL=http://127.0.0.1:8000 .venv/bin/python verify.py
 `QUERY_OUT_OF_RANGE`、`NEGATIVE_MAX_GAP`、`SAMPLE_GAP_EXCEEDED`、
 `INVALID_JSON` / `INVALID_BODY`。
 
+### 逐行曝光（rolling shutter）
+
+部分航摄相机逐行曝光，同一帧各行的真实采集时刻不同。请求体可选携带
+`rolling_shutter` 对象：
+
+```json
+{
+  "samples": [ ... ],
+  "queries": [
+    {"frameT": 1700000000000000000, "row": 0},
+    {"frameT": 1700000000000000000, "row": 1}
+  ],
+  "max_gap_ns": 10000,
+  "rolling_shutter": {
+    "rowCount": 2000,
+    "linePeriodNs": 2500,
+    "direction": "top_to_bottom"
+  }
+}
+```
+
+| 字段 | 约束 |
+|---|---|
+| `rolling_shutter.rowCount` | 整数，2–20000（含端点） |
+| `rolling_shutter.linePeriodNs` | 正整数；相邻两行曝光的时间间隔（纳秒） |
+| `rolling_shutter.direction` | `"top_to_bottom"` 或 `"bottom_to_top"` |
+
+启用后，`queries` 每项为 `{"frameT": <ns>, "row": k}`，其中 `row` 为
+**零基**行号。曝光序号按读出方向换算：
+
+- `top_to_bottom`：序号 = `row`
+- `bottom_to_top`：序号 = `rowCount - 1 - row`
+
+派生采集时刻为整数纳秒 `t = frameT + 序号 × linePeriodNs`。各项的派生
+`t` 必须**严格递增**（与原整数 queries 相同的定序规则），并沿用原采样
+范围、`max_gap_ns` 最大包围间隔、最短弧与连续定号规则。
+
+响应仍为 `{"attitudes": [...]}`，每项按请求顺序返回：
+
+```json
+{"frameT": 1700000000000000000, "row": 0, "t": 1700000000000000000,
+ "q": [1.0, 0.0, 0.0, 0.0]}
+```
+
+即回显 `frameT`、`row`，并给出派生 `t` 与单位四元数。
+
+逐行曝光模式的额外错误码（均为 `400`，定位到查询索引或配置字段，
+不产生部分姿态）：`ROW_COUNT_OUT_OF_RANGE`（路径
+`rolling_shutter.rowCount`）、`NON_POSITIVE_LINE_PERIOD`（路径
+`rolling_shutter.linePeriodNs`）、`INVALID_DIRECTION`（路径
+`rolling_shutter.direction`）、`ROW_OUT_OF_RANGE`（路径
+`queries[i].row`）；派生时刻倒序、越出样本范围或落入超长间隙时分别
+复用 `NON_INCREASING_QUERY_TIME`、`QUERY_OUT_OF_RANGE`、
+`SAMPLE_GAP_EXCEEDED`，定位到 `queries[i]`，并在错误上下文中附带
+`frameT`、`row`、`derived_t`。
+
+**省略 `rolling_shutter`（或显式传 `null`）时**，`queries` 仍为整数
+纳秒数组，响应项仍为 `{"t", "q"}`，请求、响应与错误语义与旧版完全
+一致。
+
 ### `GET /health`
 
 返回 `{"status": "ok"}`，供容器健康检查使用。

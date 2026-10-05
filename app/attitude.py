@@ -26,6 +26,16 @@ MIN_QUERIES = 1
 MAX_QUERIES = 500
 QUATERNION_COMPONENTS = 4  # fixed order: w, x, y, z
 
+# Rolling-shutter (progressive-scan) cameras expose each sensor row at a
+# different instant within a frame.  rowCount bounds the sensor size, and
+# the readout direction maps a zero-based row to its exposure sequence
+# number (0 = first row exposed).
+MIN_ROW_COUNT = 2
+MAX_ROW_COUNT = 20000
+DIRECTION_TOP_TO_BOTTOM = "top_to_bottom"
+DIRECTION_BOTTOM_TO_TOP = "bottom_to_top"
+_ROLLING_SHUTTER_DIRECTIONS = (DIRECTION_TOP_TO_BOTTOM, DIRECTION_BOTTOM_TO_TOP)
+
 # Largest integer exactly representable as an IEEE-754 double.  Float
 # timestamps beyond this cannot be trusted to be exact nanoseconds.
 _SAFE_INTEGER_FLOAT = 2 ** 53
@@ -342,12 +352,180 @@ def _validate_max_gap(raw_max_gap: Any) -> int:
     return max_gap
 
 
+# ---------------------------------------------------------------------------
+# rolling shutter (progressive exposure) support
+# ---------------------------------------------------------------------------
+
+def _validate_rolling_shutter(raw: Any) -> Dict[str, Any] | None:
+    """Validate the optional ``rolling_shutter`` camera description.
+
+    Returns a normalized ``{"row_count", "line_period_ns", "direction"}``
+    mapping, or ``None`` when the field is omitted (legacy integer-queries
+    mode).  Every problem is located to its configuration field path.
+    """
+    if raw is None:
+        return None
+    base = "rolling_shutter"
+    if not isinstance(raw, dict):
+        raise AttitudeInputError(
+            "INVALID_TYPE",
+            f"{base} must be an object with 'rowCount', 'linePeriodNs' "
+            f"and 'direction' fields",
+            path=base,
+        )
+
+    raw_row_count = _require_field(raw, "rowCount", f"{base}.rowCount", None)
+    raw_line_period = _require_field(raw, "linePeriodNs", f"{base}.linePeriodNs", None)
+    raw_direction = _require_field(raw, "direction", f"{base}.direction", None)
+
+    # rowCount / linePeriodNs are configuration counts, not timestamps:
+    # bools are rejected but plain JSON integers (of any magnitude) are fine.
+    if isinstance(raw_row_count, bool) or not isinstance(raw_row_count, int):
+        raise AttitudeInputError(
+            "INVALID_TYPE",
+            f"{base}.rowCount must be an integer, got "
+            f"{type(raw_row_count).__name__}",
+            path=f"{base}.rowCount",
+        )
+    if not MIN_ROW_COUNT <= raw_row_count <= MAX_ROW_COUNT:
+        raise AttitudeInputError(
+            "ROW_COUNT_OUT_OF_RANGE",
+            f"{base}.rowCount must be between {MIN_ROW_COUNT} and "
+            f"{MAX_ROW_COUNT}, got {raw_row_count}",
+            path=f"{base}.rowCount",
+            context={"rowCount": raw_row_count},
+        )
+
+    if isinstance(raw_line_period, bool) or not isinstance(raw_line_period, int):
+        raise AttitudeInputError(
+            "INVALID_TYPE",
+            f"{base}.linePeriodNs must be a positive integer, got "
+            f"{type(raw_line_period).__name__}",
+            path=f"{base}.linePeriodNs",
+        )
+    if raw_line_period <= 0:
+        raise AttitudeInputError(
+            "NON_POSITIVE_LINE_PERIOD",
+            f"{base}.linePeriodNs must be a positive integer, got "
+            f"{raw_line_period}",
+            path=f"{base}.linePeriodNs",
+            context={"linePeriodNs": raw_line_period},
+        )
+
+    if not isinstance(raw_direction, str) or raw_direction not in _ROLLING_SHUTTER_DIRECTIONS:
+        raise AttitudeInputError(
+            "INVALID_DIRECTION",
+            f"{base}.direction must be one of "
+            f"{list(_ROLLING_SHUTTER_DIRECTIONS)}, got {raw_direction!r}",
+            path=f"{base}.direction",
+            context={"direction": raw_direction},
+        )
+
+    return {
+        "row_count": raw_row_count,
+        "line_period_ns": raw_line_period,
+        "direction": raw_direction,
+    }
+
+
+def _validate_row_queries(
+    raw_queries: Any, config: Dict[str, Any]
+) -> List[Dict[str, int]]:
+    """Validate per-row queries and derive each row's capture instant.
+
+    Each query must be an object carrying an integer ``frameT`` and a
+    zero-based ``row``.  The exposure sequence number is ``row`` for
+    ``top_to_bottom`` readout and ``row_count - 1 - row`` for
+    ``bottom_to_top``; the capture time is
+    ``frameT + sequence * line_period_ns`` (exact integer nanoseconds).
+    The derived instants must be strictly increasing in request order.
+    """
+    base = "queries"
+    if not isinstance(raw_queries, list):
+        raise AttitudeInputError(
+            "INVALID_TYPE",
+            f"{base} must be an array of {MIN_QUERIES}..{MAX_QUERIES} "
+            f"objects with 'frameT' and 'row' when rolling_shutter is set",
+            path=base,
+        )
+    if not MIN_QUERIES <= len(raw_queries) <= MAX_QUERIES:
+        raise AttitudeInputError(
+            "QUERY_COUNT_OUT_OF_RANGE",
+            f"{base} must contain between {MIN_QUERIES} and {MAX_QUERIES} "
+            f"entries, got {len(raw_queries)}",
+            path=base,
+            context={"count": len(raw_queries)},
+        )
+
+    row_count = config["row_count"]
+    line_period = config["line_period_ns"]
+    bottom_to_top = config["direction"] == DIRECTION_BOTTOM_TO_TOP
+
+    queries: List[Dict[str, int]] = []
+    last_t: int | None = None
+    for i, raw_query in enumerate(raw_queries):
+        path = f"{base}[{i}]"
+        if not isinstance(raw_query, dict):
+            raise AttitudeInputError(
+                "INVALID_TYPE",
+                f"{path} must be an object with 'frameT' and 'row' fields",
+                index=i,
+                path=path,
+            )
+        frame_t = _require_int_ns(
+            _require_field(raw_query, "frameT", f"{path}.frameT", i),
+            f"{path}.frameT",
+            i,
+        )
+        raw_row = _require_field(raw_query, "row", f"{path}.row", i)
+        if isinstance(raw_row, bool) or not isinstance(raw_row, int):
+            raise AttitudeInputError(
+                "INVALID_TYPE",
+                f"{path}.row must be a zero-based integer row index, got "
+                f"{type(raw_row).__name__}",
+                index=i,
+                path=f"{path}.row",
+            )
+        if not 0 <= raw_row < row_count:
+            raise AttitudeInputError(
+                "ROW_OUT_OF_RANGE",
+                f"{path}.row={raw_row} is outside the valid zero-based row "
+                f"range [0, {row_count - 1}] of the {row_count}-row sensor",
+                index=i,
+                path=f"{path}.row",
+                context={"row": raw_row, "rowCount": row_count},
+            )
+
+        sequence = row_count - 1 - raw_row if bottom_to_top else raw_row
+        t = frame_t + sequence * line_period
+        if last_t is not None and t <= last_t:
+            raise AttitudeInputError(
+                "NON_INCREASING_QUERY_TIME",
+                f"{path} derives capture time t={t} which must be strictly "
+                f"greater than the previous derived t={last_t}",
+                index=i,
+                path=path,
+                context={"previous_index": i - 1, "previous_t": last_t, "derived_t": t},
+            )
+        last_t = t
+        queries.append({"frame_t": frame_t, "row": raw_row, "t": t})
+    return queries
+
+
 def interpolate_attitudes(payload: Any) -> List[Dict[str, Any]]:
     """Validate the request and interpolate attitudes at the query times.
 
-    Returns a list of ``{"t": <ns>, "q": [w, x, y, z]}`` entries in query
-    order.  Raises :class:`AttitudeInputError` on any validation problem;
-    either every query is answered or none is (no partial results).
+    Without ``rolling_shutter`` each query is an integer nanosecond
+    timestamp and each result is ``{"t": <ns>, "q": [w, x, y, z]}``.
+
+    With ``rolling_shutter`` each query is ``{"frameT": <ns>, "row": k}``;
+    the per-row capture instant is derived from the frame time, readout
+    direction and line period, and each result additionally echoes
+    ``frameT`` and ``row``: ``{"frameT", "row", "t", "q"}``.
+
+    Results are returned in request order.  Raises
+    :class:`AttitudeInputError` on any validation problem; either every
+    query is answered or none is (no partial results).
     """
     if not isinstance(payload, dict):
         raise AttitudeInputError(
@@ -358,48 +536,84 @@ def interpolate_attitudes(payload: Any) -> List[Dict[str, Any]]:
         )
 
     times, quats = _validate_samples(_require_field(payload, "samples", "samples", None))
-    query_times = _validate_queries(_require_field(payload, "queries", "queries", None))
+    config = _validate_rolling_shutter(payload.get("rolling_shutter"))
     max_gap = _validate_max_gap(_require_field(payload, "max_gap_ns", "max_gap_ns", None))
+    raw_queries = _require_field(payload, "queries", "queries", None)
+    if config is None:
+        queries: List[Dict[str, Any]] = [
+            {"t": t} for t in _validate_queries(raw_queries)
+        ]
+    else:
+        queries = _validate_row_queries(raw_queries, config)
 
     first_t, last_t = times[0], times[-1]
     last_interval = len(times) - 2
 
-    results: List[Dict[str, Any]] = []
-    for query_index, t in enumerate(query_times):
+    for query_index, query in enumerate(queries):
+        t = query["t"]
         if t < first_t or t > last_t:
+            context: Dict[str, Any] = {"sample_start": first_t, "sample_end": last_t}
+            if config is not None:
+                context.update(
+                    {"frameT": query["frame_t"], "row": query["row"], "derived_t": t}
+                )
+                message = (
+                    f"queries[{query_index}] derives t={t} which lies outside "
+                    f"the sampled interval [{first_t}, {last_t}]"
+                )
+            else:
+                message = (
+                    f"queries[{query_index}]={t} lies outside the sampled "
+                    f"interval [{first_t}, {last_t}]"
+                )
             raise AttitudeInputError(
                 "QUERY_OUT_OF_RANGE",
-                f"queries[{query_index}]={t} lies outside the sampled "
-                f"interval [{first_t}, {last_t}]",
+                message,
                 index=query_index,
                 path=f"queries[{query_index}]",
-                context={"sample_start": first_t, "sample_end": last_t},
+                context=context,
             )
         i = bisect_right(times, t) - 1
         if i > last_interval:  # query exactly at the final sample
             i = last_interval
         gap = times[i + 1] - times[i]
         if gap > max_gap:
+            context = {
+                "sample_index": i,
+                "interval": [times[i], times[i + 1]],
+                "gap_ns": gap,
+                "max_gap_ns": max_gap,
+            }
+            if config is not None:
+                context.update(
+                    {"frameT": query["frame_t"], "row": query["row"], "derived_t": t}
+                )
+                subject = f"queries[{query_index}] derives t={t} which is"
+            else:
+                subject = f"queries[{query_index}]={t} is"
             raise AttitudeInputError(
                 "SAMPLE_GAP_EXCEEDED",
-                f"queries[{query_index}]={t} is enclosed by samples[{i}] "
-                f"(t={times[i]}) and samples[{i + 1}] (t={times[i + 1]}) "
-                f"whose gap {gap} ns exceeds max_gap_ns={max_gap}",
+                f"{subject} enclosed by samples[{i}] (t={times[i]}) and "
+                f"samples[{i + 1}] (t={times[i + 1]}) whose gap {gap} ns "
+                f"exceeds max_gap_ns={max_gap}",
                 index=query_index,
                 path=f"queries[{query_index}]",
-                context={
-                    "sample_index": i,
-                    "interval": [times[i], times[i + 1]],
-                    "gap_ns": gap,
-                    "max_gap_ns": max_gap,
-                },
+                context=context,
             )
         u = (t - times[i]) / gap
-        results.append({"t": t, "q": _slerp(quats[i], quats[i + 1], u)})
+        query["q"] = _slerp(quats[i], quats[i + 1], u)
 
-    result_quats = [entry["q"] for entry in results]
+    result_quats = [query["q"] for query in queries]
     _apply_output_sign_convention(result_quats)
-    for entry in results:
+
+    results: List[Dict[str, Any]] = []
+    for query in queries:
         # normalize -0.0 to 0.0 for clean, reviewable output
-        entry["q"] = [c + 0.0 for c in entry["q"]]
+        q = [c + 0.0 for c in query["q"]]
+        if config is None:
+            results.append({"t": query["t"], "q": q})
+        else:
+            results.append(
+                {"frameT": query["frame_t"], "row": query["row"], "t": query["t"], "q": q}
+            )
     return results

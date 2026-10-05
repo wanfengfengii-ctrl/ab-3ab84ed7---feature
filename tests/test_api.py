@@ -166,3 +166,143 @@ class TestErrorResponses:
     def test_get_on_interpolate_not_allowed(self):
         response = client.get("/api/attitudes/interpolate")
         assert 400 <= response.status_code < 500
+
+
+# ---------------------------------------------------------------------------
+# rolling shutter
+# ---------------------------------------------------------------------------
+
+RS_CONFIG = {"rowCount": 4, "linePeriodNs": 2_500, "direction": "top_to_bottom"}
+
+
+def rolling_payload(direction="top_to_bottom", rows=(0, 1, 2, 3),
+                    frame_ts=None, line_period_ns=2_500, row_count=4):
+    if frame_ts is None:
+        frame_ts = [T0] * len(rows)
+    return {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + 10_000, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},
+        ],
+        "queries": [{"frameT": ft, "row": row} for ft, row in zip(frame_ts, rows)],
+        "max_gap_ns": 10_000,
+        "rolling_shutter": {
+            "rowCount": row_count,
+            "linePeriodNs": line_period_ns,
+            "direction": direction,
+        },
+    }
+
+
+class TestRollingShutterApi:
+    def test_top_to_bottom_returns_frame_t_row_t_and_quaternion(self):
+        response = post(rolling_payload(rows=(0, 1, 2, 3)))
+        assert response.status_code == 200
+        attitudes = response.json()["attitudes"]
+        assert [a["frameT"] for a in attitudes] == [T0] * 4
+        assert [a["row"] for a in attitudes] == [0, 1, 2, 3]
+        assert [a["t"] for a in attitudes] == [T0 + 2_500 * k for k in range(4)]
+        for entry in attitudes:
+            assert set(entry.keys()) == {"frameT", "row", "t", "q"}
+            assert abs(sum(c * c for c in entry["q"]) - 1.0) <= 1e-9
+
+    def test_bottom_to_top_reverses_row_order(self):
+        # rows exposed first-to-last when the sensor reads bottom-to-top
+        response = post(rolling_payload(direction="bottom_to_top",
+                                        rows=(3, 2, 1, 0)))
+        assert response.status_code == 200
+        attitudes = response.json()["attitudes"]
+        assert [a["row"] for a in attitudes] == [3, 2, 1, 0]
+        assert [a["t"] for a in attitudes] == [T0 + 2_500 * k for k in range(4)]
+        # same derived instants as the top-to-bottom request above, so the
+        # interpolated attitudes must match exactly
+        down = post(rolling_payload(rows=(0, 1, 2, 3))).json()["attitudes"]
+        for a, b in zip(attitudes, down):
+            for x, y in zip(a["q"], b["q"]):
+                assert abs(x - y) <= 1e-12
+
+    def test_results_stay_sign_continuous_across_frames(self):
+        payload = rolling_payload(
+            rows=(0, 3, 0, 1),
+            frame_ts=[T0, T0, T0 + 8_000, T0 + 8_000],
+            line_period_ns=500,
+        )
+        response = post(payload)
+        assert response.status_code == 200
+        quats = [a["q"] for a in response.json()["attitudes"]]
+        for previous, current in zip(quats, quats[1:]):
+            assert sum(a * b for a, b in zip(previous, current)) >= 0.0
+
+    def test_row_out_of_range_is_400_and_located(self):
+        response = post(rolling_payload(rows=(0, 4)))
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "ROW_OUT_OF_RANGE"
+        assert detail["index"] == 1
+        assert detail["path"] == "queries[1].row"
+
+    def test_invalid_config_field_is_400_and_located(self):
+        payload = rolling_payload()
+        payload["rolling_shutter"]["linePeriodNs"] = 0
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "NON_POSITIVE_LINE_PERIOD"
+        assert detail["path"] == "rolling_shutter.linePeriodNs"
+
+    def test_bad_direction_is_400_and_located(self):
+        payload = rolling_payload()
+        payload["rolling_shutter"]["direction"] = "sideways"
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "INVALID_DIRECTION"
+        assert detail["path"] == "rolling_shutter.direction"
+
+    def test_non_increasing_derived_time_is_400(self):
+        response = post(rolling_payload(rows=(2, 1)))
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "NON_INCREASING_QUERY_TIME"
+        assert detail["index"] == 1
+
+    def test_derived_time_out_of_sample_range_is_400(self):
+        payload = rolling_payload(rows=(0,), frame_ts=[T0 + 20_000])
+        response = post(payload)
+        assert response.status_code == 400
+        detail = response.json()["detail"]
+        assert detail["code"] == "QUERY_OUT_OF_RANGE"
+        assert detail["index"] == 0
+
+    def test_derived_time_in_overlong_gap_is_400_with_no_partial_result(self):
+        payload = {
+            "samples": [
+                {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+                {"t": T0 + 10_000_000, "q": [1.0, 0.0, 0.0, 0.0]},
+            ],
+            "queries": [{"frameT": T0 + 5_000_000, "row": 0}],
+            "max_gap_ns": 1_000,
+            "rolling_shutter": RS_CONFIG,
+        }
+        response = post(payload)
+        assert response.status_code == 400
+        body = response.json()
+        detail = body["detail"]
+        assert detail["code"] == "SAMPLE_GAP_EXCEEDED"
+        assert detail["index"] == 0
+        assert detail["sample_index"] == 0
+        assert detail["derived_t"] == T0 + 5_000_000
+        assert "attitudes" not in body
+
+    def test_integer_queries_rejected_when_rolling_shutter_enabled(self):
+        payload = rolling_payload()
+        payload["queries"] = [T0, T0 + 2_500]
+        response = post(payload)
+        assert response.status_code == 400
+        assert response.json()["detail"]["code"] == "INVALID_TYPE"
+
+    def test_legacy_request_without_rolling_shutter_unchanged(self):
+        response = post(valid_payload())
+        assert response.status_code == 200
+        attitudes = response.json()["attitudes"]
+        assert [set(a.keys()) for a in attitudes] == [{"t", "q"}] * 5

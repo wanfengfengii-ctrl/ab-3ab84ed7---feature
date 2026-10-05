@@ -147,6 +147,9 @@ def check_smoke() -> bool:
     }
     status, body = post_interpolate(payload)
     expect(status == 200, f"interpolation request returns 200 (got {status})")
+    original_body = None
+    if status == 200:
+        original_body = body
     if status == 200:
         attitudes = body.get("attitudes", [])
         expect([a.get("t") for a in attitudes] == queries,
@@ -247,6 +250,142 @@ def check_smoke() -> bool:
     expect(400 <= status < 500 and detail.get("code") == "NON_INCREASING_SAMPLE_TIME"
            and detail.get("index") == 1,
            f"non-increasing sample times rejected with index (got {status} {detail})")
+
+    # -- 7. rolling shutter: per-row exposure instants, both directions ----
+    rs_config = {"rowCount": 4, "linePeriodNs": 2_500}
+    for direction, rows in (
+        ("top_to_bottom", [0, 1, 2, 3]),
+        ("bottom_to_top", [3, 2, 1, 0]),
+    ):
+        rs_payload = {
+            "samples": [
+                {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+                {"t": T0 + gap, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},
+            ],
+            "queries": [{"frameT": T0, "row": row} for row in rows],
+            "max_gap_ns": gap,
+            "rolling_shutter": {**rs_config, "direction": direction},
+        }
+        status_rs, body_rs = post_interpolate(rs_payload)
+        attitudes_rs = body_rs.get("attitudes", [])
+        shape_ok = status_rs == 200 and all(
+            set(a.keys()) == {"frameT", "row", "t", "q"}
+            and a.get("frameT") == T0
+            for a in attitudes_rs
+        )
+        expect(shape_ok,
+               f"rolling shutter {direction}: 200 with frameT/row/t/q per entry "
+               f"(got {status_rs})")
+        if status_rs == 200:
+            expect([a.get("row") for a in attitudes_rs] == rows
+                   and [a.get("t") for a in attitudes_rs]
+                   == [T0 + 2_500 * k for k in range(4)],
+                   f"rolling shutter {direction}: rows echoed in request order "
+                   f"and capture instants derived along the readout direction")
+            analytic_ok = all(
+                all(abs(a - e) <= 1e-9
+                    for a, e in zip(entry["q"], q_z(u * math.pi / 2.0)))
+                and abs(sum(c * c for c in entry["q"]) - 1.0) <= 1e-9
+                for entry, u in zip(attitudes_rs, (0.0, 0.25, 0.5, 0.75))
+            )
+            expect(analytic_ok,
+                   f"rolling shutter {direction}: per-row attitudes match "
+                   f"analytic slerp and stay unit norm")
+            quats = [a["q"] for a in attitudes_rs]
+            dots_ok = all(
+                sum(x * y for x, y in zip(p, c)) >= 0.0
+                for p, c in zip(quats, quats[1:])
+            )
+            expect(dots_ok,
+                   f"rolling shutter {direction}: consecutive rows keep "
+                   f"non-negative dot product")
+
+    # -- 8. rolling shutter: derived-time ordering / range / gap errors ----
+    rs_base_payload = {
+        "samples": [
+            {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+            {"t": T0 + gap, "q": [SQRT2_2, 0.0, 0.0, SQRT2_2]},
+        ],
+        "queries": [{"frameT": T0, "row": row} for row in (0, 1, 2, 3)],
+        "max_gap_ns": gap,
+        "rolling_shutter": {**rs_config, "direction": "top_to_bottom"},
+    }
+    rs_bad_cases = [
+        (
+            "descending rows derive non-increasing instants",
+            {**rs_base_payload, "queries": [{"frameT": T0, "row": 2},
+                                            {"frameT": T0, "row": 1}]},
+            "NON_INCREASING_QUERY_TIME", "queries[1]",
+        ),
+        (
+            "row index out of range",
+            {**rs_base_payload, "queries": [{"frameT": T0, "row": 4}]},
+            "ROW_OUT_OF_RANGE", "queries[0].row",
+        ),
+        (
+            "illegal rolling_shutter config field",
+            {**rs_base_payload,
+             "rolling_shutter": {"rowCount": 4, "linePeriodNs": 0,
+                                 "direction": "top_to_bottom"}},
+            "NON_POSITIVE_LINE_PERIOD", "rolling_shutter.linePeriodNs",
+        ),
+        (
+            "illegal readout direction",
+            {**rs_base_payload,
+             "rolling_shutter": {"rowCount": 4, "linePeriodNs": 2_500,
+                                 "direction": "sideways"}},
+            "INVALID_DIRECTION", "rolling_shutter.direction",
+        ),
+        (
+            "derived instant leaves the sampled range",
+            {**rs_base_payload,
+             "queries": [{"frameT": T0 + 100_000, "row": 0}]},
+            "QUERY_OUT_OF_RANGE", "queries[0]",
+        ),
+        (
+            "derived instant falls inside an over-long gap",
+            {
+                "samples": [
+                    {"t": T0, "q": [1.0, 0.0, 0.0, 0.0]},
+                    {"t": T0 + 10_000_000, "q": [1.0, 0.0, 0.0, 0.0]},
+                ],
+                "queries": [{"frameT": T0 + 5_000_000, "row": 0}],
+                "max_gap_ns": 1_000,
+                "rolling_shutter": {**rs_config, "direction": "top_to_bottom"},
+            },
+            "SAMPLE_GAP_EXCEEDED", "queries[0]",
+        ),
+    ]
+    for label, bad_payload, want_code, want_path in rs_bad_cases:
+        status_b, body_b = post_interpolate(bad_payload)
+        detail_b = body_b.get("detail", {})
+        expect(400 <= status_b < 500
+               and detail_b.get("code") == want_code
+               and detail_b.get("path") == want_path
+               and "attitudes" not in body_b,
+               f"rolling shutter: {label} -> {want_code} at {want_path} "
+               f"(got {status_b} {detail_b})")
+
+    # -- 9. compatibility regression: omitting rolling_shutter is the ------
+    # --    original integer-query contract, and the response is unchanged -
+    status_legacy, body_legacy = post_interpolate(payload)
+    legacy_shape_ok = (
+        status_legacy == 200
+        and [set(a.keys()) for a in body_legacy.get("attitudes", [])]
+        == [{"t", "q"}] * 5
+    )
+    expect(legacy_shape_ok,
+           "compatibility: request without rolling_shutter keeps integer "
+           "queries and {t, q}-only responses")
+    if original_body is not None and status_legacy == 200:
+        expect(body_legacy == original_body,
+               "compatibility: legacy response is unchanged by the new feature")
+    # and an explicit null rolling_shutter behaves exactly the same way
+    null_rs = json.loads(json.dumps(payload))
+    null_rs["rolling_shutter"] = None
+    status_null, body_null = post_interpolate(null_rs)
+    expect(status_null == 200 and body_null == body_legacy,
+           "compatibility: explicit rolling_shutter=null is legacy mode")
 
     if failures:
         print(f"SMOKE: FAIL ({len(failures)} check(s) failed)")
