@@ -1,0 +1,1 @@
+"""Attitude interpolation service package."""

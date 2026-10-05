@@ -1,0 +1,37 @@
+# Attitude interpolation service and its one-shot verification.
+#
+#   docker compose up app                        # serve on HOST_PORT (default 8080)
+#   HOST_PORT=9000 docker compose up app         # serve on a custom host port
+#   docker compose up --exit-code-from verify verify   # build, test, smoke, exit
+#
+# `verify` is a one-shot service: it starts only after `app` passes its
+# health check, runs compile checks + the pytest suite + live API smoke
+# checks (interpolation accuracy/continuity and gap rejection), then exits
+# with a bitmask exit code summarizing the stages (0 = all passed).
+
+services:
+  app:
+    build: .
+    image: attitude-interpolator
+    ports:
+      - "${HOST_PORT:-8080}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  verify:
+    image: attitude-interpolator
+    build: .
+    command: ["python", "verify.py"]
+    environment:
+      API_BASE_URL: http://app:8000
+    depends_on:
+      app:
+        condition: service_healthy
